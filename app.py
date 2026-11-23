@@ -10,7 +10,7 @@ import unicodedata
 
 ROOT = Path(__file__).parent
 PORT = 8765
-CACHE_VERSION = 18
+CACHE_VERSION = 20
 NS = {'m': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
 
 def cell_value(cell, shared):
@@ -49,31 +49,26 @@ def excel_rows(path):
         return sheets
 
 def accounting_summary():
-    paths = []
-    account_export = next((path for path in ROOT.glob('*.xlsx')
-                           if 'podľa účtov' in unicodedata.normalize('NFC', path.name)), None)
-    has_account_export = account_export is not None
-    if account_export:
-        paths.append(account_export)
-    for path in ROOT.glob('*.xlsx'):
-        name = unicodedata.normalize('NFC', path.name)
-        if account_export:
-            continue
-        if name.startswith('Vecné položky 2021'):
-            paths.append(path)
-        elif name.startswith('Vecné položky 07') and not has_account_export:
-            paths.append(path)
+    paths, account_export = accounting_export_paths()
     by_year = {}
     monthly_net_profit = {}
+    covered_periods = set()
     for path in paths:
-        for _, rows in excel_rows(path):
+        sheets = excel_rows(path)
+        file_periods = {date_label(row.get('A')) for _, rows in sheets for row in rows[1:]}
+        allowed_periods = file_periods - covered_periods
+        if path != account_export and not allowed_periods:
+            continue
+        for _, rows in sheets:
             for row in rows[1:]:
+                period = date_label(row.get('A'))
+                if path != account_export and period not in allowed_periods:
+                    continue
                 account = str(row.get('E', '')).strip()
                 if not account or not account[0] in '56':
                     continue
                 amount = number(row.get('L'))
                 prefix = account[:2]
-                period = date_label(row.get('A'))
                 year = period[:4]
                 totals = by_year.setdefault(year, {'revenue': 0, 'expense': 0,
                                                     'depreciation': 0, 'interest': 0,
@@ -90,6 +85,7 @@ def accounting_summary():
                     totals['subsidies'] += amount
                 if period.startswith('2026-'):
                     monthly_net_profit[period] = monthly_net_profit.get(period, 0) - amount
+        covered_periods.update(file_periods)
     current_year = max(by_year, default=str(datetime.now().year))
     totals = by_year.get(current_year, {'revenue': 0, 'expense': 0, 'depreciation': 0,
                                         'interest': 0, 'subsidies': 0})
@@ -171,6 +167,25 @@ def date_label(value):
     except (ValueError, TypeError):
         return 'Neznámy mesiac'
 
+def accounting_export_paths():
+    account_export = next((path for path in ROOT.glob('*.xlsx')
+                           if 'podľa účtov' in unicodedata.normalize('NFC', path.name)), None)
+    if account_export:
+        supplements = sorted(
+            (path for path in ROOT.glob('*.xlsx')
+             if path != account_export
+             and unicodedata.normalize('NFC', path.name).startswith('Vecné položky')
+             and path.stat().st_mtime_ns > account_export.stat().st_mtime_ns),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True)
+        return [account_export, *supplements], account_export
+    paths = []
+    for path in ROOT.glob('*.xlsx'):
+        name = unicodedata.normalize('NFC', path.name)
+        if name.startswith('Vecné položky 2021') or name.startswith('Vecné položky 07'):
+            paths.append(path)
+    return paths, None
+
 def dimensions():
     ranges = []
     path = next(ROOT.glob('Dimenzie *.xlsx'), None)
@@ -227,9 +242,8 @@ def _load_data():
         rozbor['interest'] = report['ytd_interest']
     if report.get('ytd_subsidies') is not None:
         rozbor['subsidies'] = report['ytd_subsidies']
-    account_export_name = next((unicodedata.normalize('NFC', path.name)
-                                for path in ROOT.glob('*.xlsx')
-                                if 'podľa účtov' in unicodedata.normalize('NFC', path.name)), None)
+    account_paths, account_export = accounting_export_paths()
+    account_path_order = {path: index for index, path in enumerate(account_paths)}
     periods = {}
     categories_by_year = {}
     customer_profit = {}
@@ -237,20 +251,29 @@ def _load_data():
     customer_cost = {}
     customer_quantity = {}
     customer_period_sales = {}
+    product_period_sales = {}
+    product_names = {}
     delivery_items = {}
     delivery_costs = {}
     customer_names = customer_directory()
-    for path in ROOT.glob('*.xlsx'):
+    covered_account_periods = set()
+    paths = sorted(ROOT.glob('*.xlsx'), key=lambda path: account_path_order.get(path, len(account_path_order)))
+    for path in paths:
         normalized_name = unicodedata.normalize('NFC', path.name)
         if normalized_name.startswith('VZOR') or normalized_name.startswith('Dimenzie'):
             continue
-        if account_export_name and normalized_name.startswith('Vecné položky') and normalized_name != account_export_name:
+        is_account_source = normalized_name.startswith('Vecné položky')
+        if account_export and is_account_source and path not in account_paths:
             continue
         try:
             sheets = excel_rows(path)
         except Exception:
             continue
         if not sheets:
+            continue
+        file_periods = {date_label(row.get('A')) for _, rows in sheets for row in rows[1:]}
+        allowed_account_periods = file_periods - covered_account_periods
+        if is_account_source and account_export and path != account_export and not allowed_account_periods:
             continue
         files.append({'name': path.name, 'rows': max(0, len(sheets[0][1]) - 1),
                       'kind': path.stem.split(' 07')[0]})
@@ -259,6 +282,9 @@ def _load_data():
                 continue
             for row in rows[1:]:
                 if normalized_name.startswith('Vecné'):
+                    if (account_export and path != account_export
+                            and date_label(row.get('A')) not in allowed_account_periods):
+                        continue
                     account = str(row.get('E', '')).strip()
                     amount = number(row.get('J'))
                     if not amount or not account.startswith('5'):
@@ -300,6 +326,16 @@ def _load_data():
                     revenue = number(row.get('L'))
                     cost = number(row.get('M'))
                     period = date_label(row.get('A'))
+                    product_code = row.get('E', '').strip()
+                    product_name = row.get('F', '').strip()
+                    product_id = product_code or product_name or 'Bez priradeného produktu'
+                    if product_name:
+                        product_names.setdefault(product_id, product_name)
+                    product_entry = product_period_sales.setdefault(period, {}).setdefault(
+                        product_id, {'revenue': 0, 'cost': 0, 'quantity': 0, 'transport': 0})
+                    product_entry['revenue'] += revenue
+                    product_entry['cost'] += cost
+                    product_entry['quantity'] += abs(number(row.get('J')))
                     entry = periods.setdefault(period, {'revenue': 0, 'cost': 0, 'quantity': 0})
                     entry['revenue'] += revenue
                     entry['cost'] += cost
@@ -318,7 +354,8 @@ def _load_data():
                     if delivery_id:
                         delivery = delivery_items.setdefault(
                             delivery_id, {'customer_codes': set(), 'revenue': 0,
-                                          'cost': 0, 'quantity': 0, 'periods': {}})
+                                          'cost': 0, 'quantity': 0, 'periods': {},
+                                          'products': {}})
                         if customer_code:
                             delivery['customer_codes'].add(customer_code)
                         delivery['revenue'] += revenue
@@ -329,6 +366,9 @@ def _load_data():
                         delivery_period['revenue'] += revenue
                         delivery_period['cost'] += cost
                         delivery_period['quantity'] += abs(number(row.get('J')))
+                        delivery_product = delivery['products'].setdefault(
+                            period, {}).setdefault(product_id, {'revenue': 0})
+                        delivery_product['revenue'] += revenue
                     if customer_code in customer_names:
                         customer_names[customer] = customer_names[customer_code]
                 elif normalized_name.startswith('Účtované predajné dodávky'):
@@ -340,6 +380,8 @@ def _load_data():
                                        'name': row.get('I', '').strip(),
                                        'transport': 0})
                     delivery['transport'] += number(row.get('Z'))
+        if is_account_source and account_export:
+            covered_account_periods.update(file_periods)
     for customer in customer_profit:
         customer_names.setdefault(customer, customer_names.get(customer[:5], f'Zákazník {customer[:5]}'))
     deliveries = []
@@ -354,6 +396,12 @@ def _load_data():
             unmatched_delivery_count += 1
             unmatched_delivery_transport += delivery_cost['transport']
             continue
+        for period, products in items['products'].items():
+            period_revenue = sum(abs(value['revenue']) for value in products.values())
+            for product_id, value in products.items():
+                product_period_sales[period][product_id]['transport'] += (
+                    delivery_cost['transport'] * abs(value['revenue']) / period_revenue
+                    if period_revenue else 0)
         shipment_customer = delivery_cost['customer']
         item_customers = items['customer_codes']
         customer_matches = (len(item_customers) == 1
@@ -430,6 +478,34 @@ def _load_data():
                         - allocated_shared_cost),
                 'quantity': value['quantity'],
             }
+    product_period_data = {}
+    for period, product_values in product_period_sales.items():
+        revenue_total = sum(value['revenue'] for value in product_values.values())
+        transport_total = sum(value['transport'] for value in product_values.values())
+        gross_after_transport = sum(
+            value['revenue'] + value['cost'] - value['transport']
+            for value in product_values.values())
+        if period in report.get('months', {}):
+            shared_cost = gross_after_transport - report['months'][period]['net_profit']
+        elif period in months:
+            direct_cost_total = abs(sum(value['cost'] for value in product_values.values()))
+            shared_cost = months[period] - direct_cost_total - transport_total
+        else:
+            continue
+        product_period_data[period] = {}
+        for product_id, value in product_values.items():
+            allocated_shared_cost = (
+                shared_cost * value['revenue'] / revenue_total if revenue_total else 0)
+            product_period_data[period][product_id] = {
+                'revenue': value['revenue'],
+                'cost': abs(value['cost']),
+                'profit': value['revenue'] + value['cost'],
+                'transport': value['transport'],
+                'shared': allocated_shared_cost,
+                'net': (value['revenue'] + value['cost'] - value['transport']
+                        - allocated_shared_cost),
+                'quantity': value['quantity'],
+            }
     for period, entry in periods.items():
         entry['cost'] = abs(entry['cost'])
         entry['profit'] = entry['revenue'] - entry['cost']
@@ -497,6 +573,8 @@ def _load_data():
             'customer_cost': customer_cost, 'customer_quantity': customer_quantity,
             'customer_names': customer_names,
             'customer_period_data': customer_period_data,
+            'product_names': product_names,
+            'product_period_data': product_period_data,
             'deliveries': deliveries,
             'delivery_summary': {
                 'has_export': bool(delivery_costs),
